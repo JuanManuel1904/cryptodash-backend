@@ -1,22 +1,40 @@
 import asyncio
+import os
 from contextlib import asynccontextmanager
+
+# load_dotenv MUST run before any app module is imported so os.getenv() works everywhere
+from dotenv import load_dotenv
+load_dotenv()
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.ws_manager import manager
-from app.coingecko import fetch_prices, get_history, COINS
+from app.coingecko import (
+    fetch_prices, get_history, COINS,
+    fetch_coin_detail, search_coins,
+    fetch_top_coins, fetch_chart_history,
+    COIN_META,
+)
+
+# ---------------------------------------------------------------------------
+# Background broadcast
+# ---------------------------------------------------------------------------
+
+BROADCAST_INTERVAL = 30  # seconds — safe margin for Demo API (30 req/min)
 
 
 async def price_broadcast_loop():
+    await asyncio.sleep(2)  # let server finish startup
     while True:
-        prices = await fetch_prices()
-        if prices:
-            await manager.broadcast({"type": "prices", "data": prices})
-            print(f"[Scheduler] Broadcast a {len(manager.active_connections)} cliente(s)")
-        else:
-            print("[Scheduler] Sin datos, reintentando en 10s")
-        await asyncio.sleep(10)
+        try:
+            prices = await fetch_prices()
+            if prices and manager.active_connections:
+                await manager.broadcast({"type": "prices", "data": prices})
+                print(f"[Broadcast] {len(prices)} coins → {len(manager.active_connections)} client(s)")
+        except Exception as e:
+            print(f"[Broadcast] error: {e}")
+        await asyncio.sleep(BROADCAST_INTERVAL)
 
 
 @asynccontextmanager
@@ -26,97 +44,85 @@ async def lifespan(app: FastAPI):
     task.cancel()
 
 
-app = FastAPI(
-    title="CryptoDash API",
-    version="1.0.0",
-    description="""
-## CryptoDash Backend
+# ---------------------------------------------------------------------------
+# App
+# ---------------------------------------------------------------------------
 
-Precios de criptomonedas en tiempo real consumidos desde CoinGecko.
+app = FastAPI(title="CryptoDash API", version="2.0.0", lifespan=lifespan)
 
-### Endpoints REST
-Usa `/api/prices` para un snapshot inicial y `/api/history/{coin_id}` para el historial en memoria.
-
-### WebSocket
-Conéctate a `/ws/prices` para recibir actualizaciones cada 10 segundos.
-
-```js
-const ws = new WebSocket('ws://localhost:8000/ws/prices')
-ws.onmessage = e => console.log(JSON.parse(e.data))
-```
-
-### Monedas soportadas
-`bitcoin` · `ethereum` · `solana` · `binancecoin` · `cardano`
-    """,
-    lifespan=lifespan,
-)
+_raw_origins    = os.getenv("ALLOWED_ORIGINS", "http://localhost:5173")
+ALLOWED_ORIGINS = [o.strip() for o in _raw_origins.split(",")]
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+# ---------------------------------------------------------------------------
+# Routes
+# ---------------------------------------------------------------------------
 
-@app.get("/ping", tags=["Health"])
+@app.get("/ping")
 async def ping():
-    """Verifica que el servidor está corriendo."""
-    return {"status": "ok", "message": "CryptoDash backend running"}
+    key = os.getenv("COINGECKO_API_KEY", "").strip()
+    return {"status": "ok", "api_key_loaded": bool(key)}
 
 
-@app.get("/api/prices", tags=["Prices"])
+@app.get("/api/prices")
 async def get_prices():
-    """
-    Retorna el precio actual de todas las monedas soportadas.
-
-    Útil para la carga inicial del dashboard antes de conectar el WebSocket.
-    El campo `source` indica si los datos son `live` (CoinGecko) o `mock` (fallback).
-    """
-    prices = await fetch_prices()
-    if prices is None:
-        return {"error": "No se pudo obtener datos de CoinGecko"}
-    return {"data": prices}
+    return {"data": await fetch_prices()}
 
 
-@app.get("/api/history/{coin_id}", tags=["Prices"])
+@app.get("/api/coins")
+async def get_supported_coins():
+    return {"coins": [{"id": cid, **meta} for cid, meta in COIN_META.items()]}
+
+
+@app.get("/api/history/{coin_id}")
 async def get_coin_history(coin_id: str):
-    """
-    Retorna el historial de precios en memoria de una moneda (últimos 60 puntos).
-
-    **coin_id** debe ser uno de: `bitcoin`, `ethereum`, `solana`, `binancecoin`, `cardano`
-    """
     if coin_id not in COINS:
-        return {"error": f"Moneda no soportada. Opciones: {COINS}"}
+        return {"error": f"Unsupported coin. Options: {COINS}"}
     return {"coin_id": coin_id, "history": get_history(coin_id)}
 
 
-@app.get("/api/coins", tags=["Prices"])
-async def get_supported_coins():
-    """Lista las monedas soportadas con sus metadatos."""
-    from app.coingecko import COIN_META
-    return {"coins": [
-        {"id": coin_id, **meta}
-        for coin_id, meta in COIN_META.items()
-    ]}
+@app.get("/api/coin/{coin_id}/chart")
+async def get_coin_chart(coin_id: str, days: int = 1):
+    days = max(1, min(days, 365))
+    return {"coin_id": coin_id, "days": days, "points": await fetch_chart_history(coin_id, days)}
 
+
+@app.get("/api/coin/{coin_id}")
+async def get_coin_detail(coin_id: str):
+    detail = await fetch_coin_detail(coin_id)
+    if not detail:
+        return {"error": f"No data for '{coin_id}'"}
+    return {"data": detail}
+
+
+@app.get("/api/search")
+async def search(q: str = ""):
+    if not q.strip():
+        return {"results": []}
+    return {"results": await search_coins(q.strip())}
+
+
+@app.get("/api/top-coins")
+async def get_top_coins(sort_by: str = "market_cap", per_page: int = 50):
+    per_page = max(10, min(per_page, 250))
+    return {"coins": await fetch_top_coins(sort_by=sort_by, per_page=per_page)}
+
+
+# ---------------------------------------------------------------------------
+# WebSocket
+# ---------------------------------------------------------------------------
 
 @app.websocket("/ws/prices")
 async def websocket_prices(websocket: WebSocket):
-    """
-    WebSocket que emite precios actualizados cada 10 segundos.
-
-    Formato del mensaje:
-    ```json
-    {
-      "type": "prices",
-      "data": [{ "id": "bitcoin", "price": 67000, ... }]
-    }
-    ```
-    """
     await manager.connect(websocket)
-    print(f"[WS] Cliente conectado. Total: {len(manager.active_connections)}")
+    print(f"[WS] Client connected. Total: {len(manager.active_connections)}")
     try:
         prices = await fetch_prices()
         if prices:
@@ -125,4 +131,4 @@ async def websocket_prices(websocket: WebSocket):
             await websocket.receive_text()
     except WebSocketDisconnect:
         manager.disconnect(websocket)
-        print(f"[WS] Cliente desconectado. Total: {len(manager.active_connections)}")
+        print(f"[WS] Client disconnected. Total: {len(manager.active_connections)}")
