@@ -13,7 +13,7 @@ from app.ws_manager import manager
 from app.coingecko import (
     fetch_prices, get_history, COINS,
     fetch_coin_detail, search_coins,
-    fetch_top_coins, fetch_chart_history,
+    fetch_top_coins, fetch_chart_history, fetch_compare,
     COIN_META,
 )
 
@@ -107,6 +107,15 @@ async def search(q: str = ""):
     if not q.strip():
         return {"results": []}
     return {"results": await search_coins(q.strip())}
+
+
+@app.get("/api/compare")
+async def compare_coins(coins: str = "bitcoin,ethereum", days: int = 7):
+    """Compare chart history for multiple coins. coins = comma-separated CoinGecko IDs."""
+    ids  = [c.strip() for c in coins.split(",") if c.strip()][:4]  # max 4
+    days = max(1, min(days, 365))
+    data = await fetch_compare(ids, days)
+    return {"days": days, "coins": data}
 
 
 @app.get("/api/top-coins")
