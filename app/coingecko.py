@@ -319,6 +319,19 @@ async def fetch_top_coins(sort_by: str = "market_cap", per_page: int = 50) -> li
             return cached or []
 
 
+async def fetch_compare(coin_ids: list[str], days: int) -> dict[str, list[dict]]:
+    """Fetch chart history for multiple coins in parallel for comparison."""
+    import asyncio
+    results = await asyncio.gather(
+        *[fetch_chart_history(cid, days) for cid in coin_ids],
+        return_exceptions=True,
+    )
+    return {
+        cid: ([] if isinstance(r, Exception) else r)
+        for cid, r in zip(coin_ids, results)
+    }
+
+
 async def fetch_chart_history(coin_id: str, days: int) -> list[dict]:
     cache_key = f"chart_{days}:{coin_id}"
     cached    = _from_cache(cache_key)
